@@ -5,6 +5,7 @@ import mysql.connector
 from mysql.connector import connect, Error
 from decimal import Decimal
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import copy, hashlib, re
 from openai import OpenAI
 import os
@@ -14,6 +15,8 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi import FastAPI, HTTPException
 import uvicorn
+from fastapi.middleware.cors import CORSMiddleware
+
 
 # print(pyodbc.version)
 
@@ -21,6 +24,16 @@ load_dotenv()
 print("TEST_ENV_SOURCE =", os.getenv("TEST_ENV_SOURCE"))
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # or restrict to ["https://yourdomain.com"]
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 #DETERMINE TAX AUTHORITY ID BY GL_ENTITY OR JOB IDD 
 tax_mock=[]
 tax_mock = {
@@ -73,6 +86,7 @@ db_config = {
     'user': os.getenv("VENDOR_DB_USER"),
     'password': os.getenv("VENDOR_DB_PASS"),
     'database': os.getenv("VENDOR_DB_NAME"),
+     
 }
 
 
@@ -81,40 +95,35 @@ db_config = {
 def get_db_connection():
     return mysql.connector.connect(**db_config)
 
-def getDBPORecordById(po_id: str):
+
+def build_po_query(po_id: str) -> str:
     """
-    Fetch PO lines with IMHSTRY quantities per line:
-      - qty_received_imhstry: sum of imhstry_qntty_rcvd on 'Receipt' rows (by item)
-      - qty_vouchered:        sum of imhstry_qntty_invcd_ap on 'AP Purchase' rows (by item)
-    Line -> item mapping is learned from 'Purchase' rows (their journal line numbers match PO lines).
-    Returns: List[dict]
+    Return the full T-SQL with @po_id set to the provided value.
+    Safely escapes single quotes in po_id.
     """
-    conn = pyodbc.connect(
-        "DRIVER={ODBC Driver 17 for SQL Server};"
-        "SERVER=SAMPRODBSERVER;"
-        "DATABASE=DayNite_test;"
-        "Trusted_Connection=yes;"
-    )
-    cursor = conn.cursor()
-    try:
-        sql = """
-        DECLARE @po_id VARCHAR(50) = ?;
+    po = (po_id or "").replace("'", "''")  # SQL-escape single quotes
+
+    sql = f"""
+DECLARE @po_id VARCHAR(50) = '{po}';
 
 -- 1) PO lines (LIST + LISTGN)
 WITH all_lines AS (
     SELECT
-        'LIST'  AS line_source,
+        'LIST' AS line_source,
         prchseordr_rn,
-        prchseordrlst_rn      AS ordrlst_rn,
-        prchseordrlst_ln      AS line_no,
+        prchseordrlst_rn AS ordrlst_rn,
+        prchseordrlst_ln AS line_no,
         prchseordrlst_vndr_prt_nmbr AS vendor_part,
         prchseordrlst_dscrptn       AS description,
         prchseordrlst_unt_msre      AS uom,
         prchseordrlst_qntty_ordrd   AS qty_ordered_line,
         prchseordrlst_qntty_rcvd    AS qty_received_line,
-        prchseordrlst_unt_cst       AS unit_cost
+        prchseordrlst_unt_cst       AS unit_cost,
+        NULLIF(invntryitm_rn,0)     AS invntryitm_rn
     FROM prchseordrlst
+
     UNION ALL
+
     SELECT
         'LISTGN',
         prchseordr_rn,
@@ -125,108 +134,97 @@ WITH all_lines AS (
         prchseordrlstgn_unt_msre,
         prchseordrlstgn_qntty_ordrd,
         prchseordrlstgn_qntty_rcvd,
-        prchseordrlstgn_unt_cst
+        prchseordrlstgn_unt_cst,
+        NULL
     FROM prchseordrlstgn
 ),
 
--- 2) Map PO line_no → item using PURCHASE rows
-line_to_item AS (
-    SELECT
-        po_id_trim     = RTRIM(imhstry_ordr_id),
-        line_no        = NULLIF(imhstry_srce_jrnl_ln, 0),
-        invntryitm_rn  = MAX(NULLIF(invntryitm_rn, 0))
-    FROM imhstry
-    WHERE imhstry_ordr_type = 'P'
-      AND RTRIM(imhstry_ordr_id) = RTRIM(@po_id)
-      AND imhstry_srce_jrnl = 'Purchase'
-      AND ISNULL(imhstry_srce_jrnl_ln, 0) <> 0
-    GROUP BY RTRIM(imhstry_ordr_id), imhstry_srce_jrnl_ln
+-- 2) LISTGN: map PO line RN -> reference RN from Purchase rows
+listgn_ref_map AS (
+    SELECT DISTINCT
+        RTRIM(imhstry_ordr_id) AS po_id_trim,
+        i.imhstry_ordrlst_rn   AS ordrlst_rn,
+        i.imhstry_rfrnce_rn    AS ref_rn
+    FROM imhstry i
+    WHERE i.imhstry_ordr_type='P'
+      AND RTRIM(i.imhstry_ordr_id)=RTRIM(@po_id)
+      AND i.imhstry_srce_jrnl='Purchase'
+      AND ISNULL(i.invntryitm_rn,0)=0
+      AND i.imhstry_rvrsl='N'
+      AND i.imhstry_vdd='N'
+      AND NULLIF(i.imhstry_ordrlst_rn,0) IS NOT NULL
 ),
 
--- 3a) RECEIVED by PO + item (inventory lines)
+-- 3) RECEIVED by inventory item (LIST)
 received_by_item AS (
     SELECT
-        po_id_trim = RTRIM(imhstry_ordr_id),
+        RTRIM(imhstry_ordr_id) AS po_id_trim,
         invntryitm_rn,
-        qty_received_imhstry =
-            SUM(CASE WHEN imhstry_rvrsl = 'Y'
-                     THEN -TRY_CAST(imhstry_qntty_rcvd AS decimal(18,6))
-                     ELSE  TRY_CAST(imhstry_qntty_rcvd AS decimal(18,6))
-                END)
+        SUM(TRY_CAST(imhstry_qntty_rcvd AS decimal(18,6))) AS qty_received
     FROM imhstry
-    WHERE imhstry_ordr_type = 'P'
-      AND RTRIM(imhstry_ordr_id) = RTRIM(@po_id)
-      AND imhstry_srce_jrnl = 'Receipt'      -- receipts only
+    WHERE imhstry_ordr_type='P'
+      AND RTRIM(imhstry_ordr_id)=RTRIM(@po_id)
+      AND imhstry_srce_jrnl='Receipt'
+      AND ISNULL(invntryitm_rn,0)<>0
+      
     GROUP BY RTRIM(imhstry_ordr_id), invntryitm_rn
 ),
 
--- 3b) RECEIVED by PO + line_no (general lines or fallback)
-received_by_line AS (
+-- 4) RECEIVED by reference (LISTGN)
+received_by_ref AS (
     SELECT
-        po_id_trim = RTRIM(imhstry_ordr_id),
-        line_no    = NULLIF(imhstry_srce_jrnl_ln, 0),
-        qty_received_imhstry =
-            SUM(CASE WHEN imhstry_rvrsl = 'Y'
-                     THEN -TRY_CAST(imhstry_qntty_rcvd AS decimal(18,6))
-                     ELSE  TRY_CAST(imhstry_qntty_rcvd AS decimal(18,6))
-                END)
+        RTRIM(imhstry_ordr_id) AS po_id_trim,
+        imhstry_rfrnce_rn,
+        SUM(TRY_CAST(imhstry_qntty_rcvd AS decimal(18,6))) AS qty_received
     FROM imhstry
-    WHERE imhstry_ordr_type = 'P'
-      AND RTRIM(imhstry_ordr_id) = RTRIM(@po_id)
-      AND imhstry_srce_jrnl = 'Receipt'      -- receipts only
-      AND ISNULL(imhstry_srce_jrnl_ln, 0) <> 0
-    GROUP BY RTRIM(imhstry_ordr_id), imhstry_srce_jrnl_ln
+    WHERE imhstry_ordr_type='P'
+      AND RTRIM(imhstry_ordr_id)=RTRIM(@po_id)
+      AND imhstry_srce_jrnl='Receipt'
+      AND ISNULL(invntryitm_rn,0)=0
+     
+    GROUP BY RTRIM(imhstry_ordr_id), imhstry_rfrnce_rn
 ),
 
--- 4a) VOUCHERED by PO + item (inventory lines)
+-- 5) VOUCHERED by inventory item (LIST)
 vouchered_by_item AS (
     SELECT
-        po_id_trim = RTRIM(imhstry_ordr_id),
+        RTRIM(imhstry_ordr_id) AS po_id_trim,
         invntryitm_rn,
-        qty_vouchered =
-            SUM(CASE WHEN imhstry_rvrsl = 'Y'
-                     THEN -TRY_CAST(imhstry_qntty_invcd_ap AS decimal(18,6))
-                     ELSE  TRY_CAST(imhstry_qntty_invcd_ap AS decimal(18,6))
-                END)
+        SUM(TRY_CAST(imhstry_qntty_invcd_ap AS decimal(18,6))) AS qty_vouchered
     FROM imhstry
-    WHERE imhstry_ordr_type = 'P'
-      AND RTRIM(imhstry_ordr_id) = RTRIM(@po_id)
-      AND imhstry_srce_jrnl = 'AP Purchase'  -- AP/voucher postings
+    WHERE imhstry_ordr_type='P'
+      AND RTRIM(imhstry_ordr_id)=RTRIM(@po_id)
+      AND imhstry_srce_jrnl='AP Purchase'
+      AND ISNULL(invntryitm_rn,0)<>0
+      AND imhstry_vdd='N'
     GROUP BY RTRIM(imhstry_ordr_id), invntryitm_rn
 ),
 
--- 4b) VOUCHERED by PO + line_no (general lines or fallback)
-vouchered_by_line AS (
+-- 6) VOUCHERED by reference (LISTGN)
+vouchered_by_ref AS (
     SELECT
-        po_id_trim = RTRIM(imhstry_ordr_id),
-        line_no    = NULLIF(imhstry_srce_jrnl_ln, 0),
-        qty_vouchered =
-            SUM(CASE WHEN imhstry_rvrsl = 'Y'
-                     THEN -TRY_CAST(imhstry_qntty_invcd_ap AS decimal(18,6))
-                     ELSE  TRY_CAST(imhstry_qntty_invcd_ap AS decimal(18,6))
-                END)
+        RTRIM(imhstry_ordr_id) AS po_id_trim,
+        imhstry_rfrnce_rn,
+        SUM(TRY_CAST(imhstry_qntty_invcd_ap AS decimal(18,6))) AS qty_vouchered
     FROM imhstry
-    WHERE imhstry_ordr_type = 'P'
-      AND RTRIM(imhstry_ordr_id) = RTRIM(@po_id)
-      AND imhstry_srce_jrnl = 'AP Purchase'  -- AP/voucher postings
-      AND ISNULL(imhstry_srce_jrnl_ln, 0) <> 0
-    GROUP BY RTRIM(imhstry_ordr_id), imhstry_srce_jrnl_ln
+    WHERE imhstry_ordr_type='P'
+      AND RTRIM(imhstry_ordr_id)=RTRIM(@po_id)
+      AND imhstry_srce_jrnl='AP Purchase'
+      AND ISNULL(invntryitm_rn,0)=0
+      AND imhstry_vdd='N'
+    GROUP BY RTRIM(imhstry_ordr_id), imhstry_rfrnce_rn
 )
 
 SELECT
     p.prchseordr_id,
     p.po_wrkordr_rn,
-
     vndr.vndr_id,
-
     COALESCE(gj.glentty_rn, glc.glentty_rn, gcmp.glentty_rn) AS glentty_rn,
     COALESCE(gj.glentty_id, glc.glentty_id, gcmp.glentty_id) AS glentty_id,
-
     jb.jb_rn,
     jb.jb_id,
     wo.wrkordr_rn,
     wo.wrkordr_id,
-
     al.line_source,
     al.line_no,
     al.vendor_part,
@@ -235,66 +233,86 @@ SELECT
     al.qty_ordered_line,
     al.qty_received_line,
 
-    -- Received: prefer item mapping; fallback to line_no (always use line_no for LISTGN)
-    ISNULL(
-        CASE WHEN al.line_source = 'LISTGN' OR lti.invntryitm_rn IS NULL
-             THEN rbl.qty_received_imhstry
-             ELSE rbi.qty_received_imhstry
-        END, 0.0
-    ) AS qty_received_imhstry,
+    -- RECEIVED
+    CASE
+        WHEN al.line_source='LIST'
+            THEN ISNULL(rbi.qty_received,0)
+        ELSE ISNULL(rbr.qty_received,0)
+    END AS qty_received_imhstry,
 
-    -- Vouchered: same selection logic
-    ISNULL(
-        CASE WHEN al.line_source = 'LISTGN' OR lti.invntryitm_rn IS NULL
-             THEN vbl.qty_vouchered
-             ELSE vbi.qty_vouchered
-        END, 0.0
-    ) AS qty_vouchered,
+    -- VOUCHERED
+    CASE
+        WHEN al.line_source='LIST'
+            THEN ISNULL(vbi.qty_vouchered,0)
+        ELSE ISNULL(vbr.qty_vouchered,0)
+    END AS qty_vouchered,
 
     al.unit_cost
 
-FROM prchseordr           AS p
-LEFT JOIN vndr            AS vndr ON p.vndr_rn = vndr.vndr_rn
-LEFT JOIN wrkordr         AS wo   ON p.po_wrkordr_rn = wo.wrkordr_rn
-LEFT JOIN jbbllngitm             ON jbbllngitm.jbbllngitm_rn = wo.jbbllngitm_rn
-LEFT JOIN jbcstcde               ON jbcstcde.jbcstcde_rn     = wo.jbcstcde_rn
-LEFT JOIN jb                     ON jb.jb_rn = COALESCE(NULLIF(p.jb_rn, 0), NULLIF(jbbllngitm.jb_rn, 0), NULLIF(jbcstcde.jb_rn, 0))
-LEFT JOIN lctn             AS l   ON p.lctn_rn  = l.lctn_rn
-LEFT JOIN glentty          AS gj  ON gj.glentty_rn   = jb.jb_glentty_glentty_rn
-LEFT JOIN glentty          AS glc ON glc.glentty_rn  = l.glentty_rn
-LEFT JOIN glentty          AS gcmp ON gcmp.glentty_rn = p.cmpny_glentty_glentty_rn
+FROM prchseordr p
+LEFT JOIN vndr vndr          ON p.vndr_rn=vndr.vndr_rn
+LEFT JOIN wrkordr wo         ON p.po_wrkordr_rn=wo.wrkordr_rn
+LEFT JOIN jbbllngitm         ON jbbllngitm.jbbllngitm_rn=wo.jbbllngitm_rn
+LEFT JOIN jbcstcde           ON jbcstcde.jbcstcde_rn=wo.jbcstcde_rn
+LEFT JOIN jb                 ON jb.jb_rn=COALESCE(NULLIF(p.jb_rn,0),NULLIF(jbbllngitm.jb_rn,0),NULLIF(jbcstcde.jb_rn,0))
+LEFT JOIN lctn l             ON p.lctn_rn=l.lctn_rn
+LEFT JOIN glentty gj         ON gj.glentty_rn=jb.jb_glentty_glentty_rn
+LEFT JOIN glentty glc        ON glc.glentty_rn=l.glentty_rn
+LEFT JOIN glentty gcmp       ON gcmp.glentty_rn=p.cmpny_glentty_glentty_rn
 
-LEFT JOIN all_lines        AS al  ON p.prchseordr_rn = al.prchseordr_rn
+LEFT JOIN all_lines al ON p.prchseordr_rn=al.prchseordr_rn
 
-LEFT JOIN line_to_item     AS lti ON RTRIM(p.prchseordr_id) = lti.po_id_trim
-                                 AND al.line_no              = lti.line_no
+-- LIST joins
+LEFT JOIN received_by_item rbi ON rbi.po_id_trim=RTRIM(p.prchseordr_id)
+                              AND al.invntryitm_rn=rbi.invntryitm_rn
+LEFT JOIN vouchered_by_item vbi ON vbi.po_id_trim=RTRIM(p.prchseordr_id)
+                               AND al.invntryitm_rn=vbi.invntryitm_rn
 
-LEFT JOIN received_by_item AS rbi ON RTRIM(p.prchseordr_id) = rbi.po_id_trim
-                                 AND lti.invntryitm_rn       = rbi.invntryitm_rn
-LEFT JOIN vouchered_by_item AS vbi ON RTRIM(p.prchseordr_id) = vbi.po_id_trim
-                                  AND lti.invntryitm_rn       = vbi.invntryitm_rn
+-- LISTGN joins
+LEFT JOIN listgn_ref_map lref ON lref.po_id_trim=RTRIM(p.prchseordr_id)
+                             AND al.line_source='LISTGN'
+                             AND al.ordrlst_rn=lref.ordrlst_rn
+LEFT JOIN received_by_ref rbr ON rbr.po_id_trim=RTRIM(p.prchseordr_id)
+                             AND rbr.imhstry_rfrnce_rn=lref.ref_rn
+LEFT JOIN vouchered_by_ref vbr ON vbr.po_id_trim=RTRIM(p.prchseordr_id)
+                              AND vbr.imhstry_rfrnce_rn=lref.ref_rn
 
-LEFT JOIN received_by_line AS rbl ON RTRIM(p.prchseordr_id) = rbl.po_id_trim
-                                 AND al.line_no              = rbl.line_no
-LEFT JOIN vouchered_by_line AS vbl ON RTRIM(p.prchseordr_id) = vbl.po_id_trim
-                                  AND al.line_no              = vbl.line_no
-
-WHERE RTRIM(p.prchseordr_id) = RTRIM(@po_id)
+WHERE RTRIM(p.prchseordr_id)=RTRIM(@po_id)
 ORDER BY al.line_source, al.line_no;
 
-        """
 
-        cursor.execute(sql, po_id)  
 
-        cols = [c[0] for c in cursor.description]
-        rows = [dict(zip(cols, r)) for r in cursor.fetchall()]
-        return rows
+"""
+    return sql
 
-    finally:
-        try:
-            cursor.close()
-        finally:
-            conn.close()
+
+
+def sql_executor(sql_query: str):
+    url = "http://10.10.30.183/api/v1/sql" # local IP
+    headers = {
+        "content-type": "application/json",
+        "X-API-Key": os.getenv('sql_client_api_key')
+    }
+    payload = {
+        "sql_query": sql_query
+    }
+
+    response = requests.post(url, headers=headers, json=payload)
+    try:
+        data = response.json()
+        return data
+    except ValueError:
+        return {"ERROR": response.text}
+
+# TO TEST:
+# python -m test-sql
+if __name__ == "__main__":
+    res = sql_executor(sql_query="WITH MainQuery AS (SELECT clntste.clntste_id as SiteId, clntste_stre_nmbr as StoreNo, clntste.clntste_nme as SiteName, wrkordr.wrkordr_id as WorkOrderId, wrkordr.wrkordr_po as PONo, wrkordr.wrkordr_nme as Description, srvcectgry.srvcectgry_id as ServiceCategoryId, wrkordr.wrkordr_type as WorkType, case when right(wrkordr_entrd_by, 1) = '2' OR right(wrkordr_entrd_by, 1) = '3' then reverse(substring(reverse(wrkordr_entrd_by), 2, 25)) else wrkordr_entrd_by end as EnteredBy, wrkordr_dte_opnd + '   ' + LTRIM(RIGHT(CONVERT(VARCHAR(20), cast(wrkordr_tme_opnd as datetime), 100), 7)) + ' (' + left(DATENAME(weekday,wrkordr_dte_opnd),3) + ')' as Created, (select max(wrkordrtchncn_dte_schdld + ' (' + left(DATENAME(weekday,wrkordrtchncn_dte_schdld),3) + ')') from wrkordrtchncn where wrkordrtchncn.wrkordr_rn = wrkordr.wrkordr_rn) as Scheduled, CASE WHEN wrkordr_escltn_stts IN ('Parts Received','Pending') THEN 'Parts Ordered' ELSE wrkordr_escltn_stts END as Status, (SELECT COUNT(wrkordreqpmnt_rn) from wrkordreqpmnt where wrkordreqpmnt.wrkordr_rn = wrkordr.wrkordr_rn) as Equipment, CASE WHEN wrkordr.srvcerqst_wblg_rn <> 0 THEN CONVERT(char(10),wblg_id) ELSE '' END as ServiceRequestNo from wrkordr join clntste on wrkordr.clntste_rn = clntste.clntste_rn join wbprfle on clntste.wbprfle_rn = wbprfle.wbprfle_rn join srvcectgry on wrkordr.srvcectgry_rn = srvcectgry.srvcectgry_rn join wblg on wrkordr.srvcerqst_wblg_rn = wblg.wblg_rn join rmte_wbusrclntste on rmte_wbusrclntste.clntste_rn = clntste.clntste_rn join scrty on wrkordr.scrty_rn = scrty.scrty_rn where rmte_wbusrclntste.wbusr_id = 'dhill' and (wrkordr_stts_ctgry = 'Open') and wrkordr.wrkordr_id >= '700000') SELECT SiteId, StoreNo, SiteName, WorkOrderId, PONo, Description, ServiceCategoryId, WorkType, EnteredBy, Created, Scheduled, Status, Equipment, ServiceRequestNo, EnteredBy FROM MainQuery ORDER BY Created DESC, WorkOrderId")
+    print(res)
+
+
+
+
 
     
 def getDBRecordById(invoice_id):
@@ -305,6 +323,8 @@ def getDBRecordById(invoice_id):
     user=os.getenv("MARKETPLACE_DB_USER"),
     password=os.getenv("MARKETPLACE_DB_PASS"),
     database=os.getenv("MARKETPLACE_DB_NAME"),
+    connection_timeout=5,     # socket connect timeout
+    connect_timeout=5,   
 )
     cursor_mysql = conn_mysql.cursor(dictionary=True)
     cursor_mysql.execute( """
@@ -432,9 +452,16 @@ def to_decimal(val):
 
 def int_or_zero(val):
     try:
-        return int(str(val).strip())
-    except:
+        if val is None:
+            return 0
+        if isinstance(val, float):      # float -> int
+            return int(val)
+        if isinstance(val, str):        # string "2" or "2.0" -> int
+            return int(float(val.strip()))
+        return int(val)                 # int, Decimal, etc.
+    except (ValueError, TypeError):
         return 0
+
 
 def format_date(val):
     if isinstance(val, datetime):
@@ -472,15 +499,16 @@ def transform_for_ui(response):
         "has_extra_charges": str(response['has_extra_charges']).lower(),
         "extra_charge_count": str(response['extra_charge_count']),
         "close_po": str(response['close_po']).lower(),
+        "ai_match": response['ai_match'],
         "invoice_file_path": str(response['invoice_file_path'])
     }
     output.append(header)
 
     # 2️ Line items
-    for idx, item in enumerate(response['line_items'], start=1):
+    for item in response['line_items']:
         output.append({
             "type": item['line_source'],
-            "line_number": str(idx),
+            "line_number": str(item['line_number']),   
             "line_item_id": item['item_id'],
             "quantity": str(item['quantity']),
             "unit_cost": f"{item['unit_cost']:.3f}",
@@ -500,11 +528,12 @@ def transform_for_ui(response):
     })
 
 
-    # 4️ Extra charges
+    # 4️ Extra charges (put the extra charge after general items for RPA)
+    line_count = len([i for i in response['line_items'] if i['line_source']=='listgn'])
     for idx, charge in enumerate(response['extra_charges'], start=1):
         output.append({
             "type": "extra_charges",
-            "charge_number": str(idx),
+            "charge_number": str(line_count + idx),
             "quantity": str(charge['quantity']),
             "unit_cost": f"{charge['unit_cost']:.2f}",
             "cost_category": charge['cost_category'],
@@ -666,9 +695,9 @@ def send_email(emailcontent: str):
     # === STEP 4: BUILD EMAIL PAYLOAD ===
     email_payload = {
         "message": {
-            "subject": "INV13",
+            "subject": "INV19",
             "body": {"contentType": "Text", "content": emailcontent},
-            "toRecipients": [{"emailAddress": {"address": "henri.sula@gmail.com"}}],  # change if needed
+            "toRecipients": [{"emailAddress": {"address": user_email}}],  # change if needed
         },
         "saveToSentItems": "true",
     }
@@ -702,6 +731,7 @@ def validate_and_match_invoice_items_against_po_strict(
     ai_match_fn=None,                 # callable(invoice_wo_ids, po_wo_ids) -> {"matches":[...], "unmatched_po_lines":[...]}
     accept_threshold: float = 0.80,
 ):
+    used_ai_match = False 
     """
     Strict identity-only validator:
       - Fails if invoice has more lines than PO (no extras logic here).
@@ -848,7 +878,9 @@ def validate_and_match_invoice_items_against_po_strict(
 
             # Merge used PO lines from DESC into the global used set
             used_po_line_nos |= desc_used_po
-
+            used_ai_match = len(desc_matches) > 0
+            print("description aiiiiiiiiiiiiiiiiiiiiiiiiia descp")
+            print(used_ai_match)
     # Final strict decision: every invoice line must be matched (count already ≤ PO count)
     matched_invoice_nos = {m["invoice_line_no"] for m in id_matches} | {m["invoice_line_no"] for m in desc_matches}
     unmatched_invoice_lines = [
@@ -915,50 +947,94 @@ def validate_and_match_invoice_items_against_po_strict(
         "invoice_items_resolved": invoice_items_resolved,
         "po_items_resolved": po_items_resolved,
         "patch_log": patch_log,
-        "ai_resp":ai_resp
+        "ai_resp":ai_resp,
+        "used_ai_match": used_ai_match 
         
         
         
     }
 
 
-def sortlinenumbers(podata,line_items):
-    poview=[]
-    for po  in podata:
-        part_number_po=po['vendor_part']
-        ordered = po['qty_ordered_line']
-        received = po['qty_received_imhstry']
-        vouchered = po['qty_vouchered']
-        unitcost=po['unit_cost']
-        elegibletobevouchered=received - vouchered
-        if(elegibletobevouchered>0):
-             poview.append({
-            'line_source':po.get('line_source'),   #might delete later
-            'line_number': po.get('line_no'),
-            'item_id': po.get('vendor_part', '').lower(),
-            'quantity': '0',       
-            'unit_cost': 0,    
-            'amount': 0         
-        })
+# def sortlinenumbers(podata,line_items):
+#     print(podata)
+#     poview=[]
+#     for po  in podata:
+#         part_number_po=po['vendor_part']
+#         ordered = po['qty_ordered_line']
+#         received = po['qty_received_imhstry']
+#         vouchered = po['qty_vouchered']
+#         unitcost=po['unit_cost']
+#         elegibletobevouchered=received - vouchered
+#         if(elegibletobevouchered>0):
+#              poview.append({
+#             'line_source':po.get('line_source'),   
+#             'line_number': po.get('line_no'),
+#             'item_id': po.get('vendor_part', '').lower(),
+#             'quantity': '0',       
+#             'unit_cost': 0,    
+#             'amount': 0         
+#         })
       
 
+#     items_by_line = {
+#         norm(item.get('line_number')): item
+#         for item in line_items
+#         if item.get('line_number') is not None
+#     }
+
+#     for i, row in enumerate(poview):
+#         key = norm(row.get('line_number'))
+#         if key in items_by_line:
+#             # Replace the whole dict with the corresponding line_item
+#             poview[i] = items_by_line[key].copy()  # .copy() to avoid aliasing
+
+#       # renumber line_number from 1..N in current order
+#     for new_num, item in enumerate(poview, start=1):
+#         item['line_number'] = new_num
+
+#     return poview
+def sortlinenumbers(podata, line_items):
+    # build poview (only eligible lines)
+    poview = [
+        {
+            'line_source': po.get('line_source', '').lower(),
+            'line_number': po.get('line_no'),
+            'item_id': po.get('vendor_part', '').lower(),
+            'quantity': '0',
+            'unit_cost': 0,
+            'amount': 0
+        }
+        for po in podata
+        if (po['qty_received_imhstry'] - po['qty_vouchered']) > 0
+    ]
+
+    # index line_items by (source, line_no)
     items_by_line = {
-        norm(item.get('line_number')): item
+        (item.get('line_source', '').lower(), norm(item.get('line_number'))): item
         for item in line_items
-        if item.get('line_number') is not None
+        if item.get('line_number') and item.get('line_source')
     }
 
-    for i, row in enumerate(poview):
-        key = norm(row.get('line_number'))
-        if key in items_by_line:
-            # Replace the whole dict with the corresponding line_item
-            poview[i] = items_by_line[key].copy()  # .copy() to avoid aliasing
+    # merge invoice data into poview
+    poview = [
+        items_by_line.get((row['line_source'], norm(row['line_number'])), row)
+        for row in poview
+    ]
 
-      # renumber line_number from 1..N in current order
-    for new_num, item in enumerate(poview, start=1):
-        item['line_number'] = new_num
+    # renumber separately for each source
+    grouped, merged = {}, []
+    for row in poview:
+        grouped.setdefault(row['line_source'], []).append(row)
 
-    return poview
+    for src in ("list", "listgn"):   # tab order
+        for new_num, item in enumerate(grouped.get(src, []), start=1):
+            item['line_number'] = new_num
+            merged.append(item)
+
+    return merged
+
+
+
 
 
 def check_taxinfo(PoData,invoice_data): 
@@ -1151,7 +1227,81 @@ def check_for_duplicate_items(invoice):
     return True
     
      
-    
+def check_invoice_total(invoice_data):
+    first_row = invoice_data[0]
+    invoiceid=first_row['invoiceID']
+    ponumber=first_row['PONumber']
+    invoice_total=to_decimal(first_row['InvoiceDetailSummary:NetAmount'])
+    invoice_handling=to_decimal(first_row['InvoiceDetailSummary:SpecialHandlingAmount'])
+    invoice_tax=to_decimal(first_row['InvoiceDetailItem:Tax'])
+
+    inv_line_total = Decimal('0.00')
+    for item in invoice_data:
+        
+        unit_price=to_decimal(item['InvoiceDetailItem:UnitPrice'])
+        unit_quantity=int(item['InvoiceDetailItem:quantity'])
+        inv_line_total += (unit_price*unit_quantity)
+
+    if(invoice_total!=inv_line_total + invoice_handling + invoice_tax):
+        return JSONResponse(content={'invoiceid':f'{invoiceid}','ponumber':f'{ponumber}','status': 'error', 'message': 'Invoice Total does not equal invoice line items total','invoice_type':'manual_review'},status_code=400)
+    return None
+
+#check if invoice has already been processed
+def check_invoice_transaction(invoiceid: str, ponumber: str):
+    """
+    Checks if an invoice has a transaction ID in apjrnl.
+    Returns a plain Python dict with status and message.
+    """
+
+    sql_query = f"""
+        SELECT 
+            a.apjrnl_id AS TransactionID,
+            a.apjrnl_invce_nmbr AS InvoiceNumber,
+            p.prchseordr_id AS PO_ID
+        FROM apjrnl a
+        LEFT JOIN prchseordr p
+            ON a.prchseordr_rn = p.prchseordr_rn
+        WHERE a.apjrnl_invce_nmbr = '{invoiceid}';
+    """
+
+    result = sql_executor(sql_query)
+
+    # Handle SQL endpoint error
+    if "ERROR" in result:
+        return {
+            "invoiceid": invoiceid,
+            "ponumber": ponumber,
+            "status": "samprodberrorapi",
+            "message": f"SQL error: {result['ERROR']}",
+            "invoice_type": "manual_review",
+            "status_code": 500
+        }
+
+    data = result.get("data", result) if isinstance(result, dict) else result
+    if not data:
+        # No record found
+        return {
+            "invoiceid": invoiceid,
+            "ponumber": ponumber,
+            "status": "ok",
+            "message": "No transaction found for this invoice",
+            "invoice_type": "new",
+            "status_code": 200
+        }
+
+    # Record found → already processed
+    trx = data[0]
+    return {
+        "invoiceid": invoiceid,
+        "ponumber": ponumber,
+        "status": "error",
+        "transaction_id":trx.get('TransactionID').strip(),
+        "message": f"Invoice already processed (TransactionID: {trx.get('TransactionID').strip()})",
+        "invoice_type": "user_processed",
+        "status_code": 400
+    }
+
+
 
     
 #check if invoice exist and then if po exists
@@ -1195,14 +1345,30 @@ def get_data(invoiceID):
     (rec.get('PONumber') for rec in (invoice_data or []) if isinstance(rec, dict) and 'PONumber' in rec),
     None
 )
-    PoDbData=getDBPORecordById(invoice_datapo)
-    PoData= clean_po_line_data(PoDbData)
-   
+    #changes
+    querysampro=build_po_query(invoice_datapo)
+    #print(querysampro)
+    queryendpointresults=sql_executor(querysampro)
+    print(queryendpointresults)
+    #PoDbData=getDBPORecordById(invoice_datapo)
+    PoData= clean_po_line_data(queryendpointresults)
+    print(PoData)
     #check if invoice exists and if po exists
     result = validate_single_po(invoiceID,invoice_data,PoData)
     if result is not True:
        
         return JSONResponse(content=result[0], status_code=result[1])
+    
+    inv_state=check_invoice_transaction(invoiceID,invoice_datapo)
+    #print("invoiceeeeeeeeeeeeeeeeeeeeeeeeeeeeee stateeeeeeeeeeeeeeeeeeeeeeeee")
+    print(inv_state)
+    if (inv_state["status"]=="error"):
+        return JSONResponse(content=inv_state, status_code=inv_state["status_code"])
+
+    #check if invoice total is correct
+    total_check = check_invoice_total(invoice_data)
+    if total_check is not None:
+        return total_check
 
 
     #compare invoice part numbers to po and AI checking for missing partnumbers and general items
@@ -1218,6 +1384,9 @@ def get_data(invoiceID):
         # New po and invoice structures from validate_and_match function with all the id-s including the added ones from descp AI matching 
         invoice_items_ready = resp["invoice_items_resolved"]
         po_items_ready      = resp["po_items_resolved"]
+        used_ai_to_match = resp["used_ai_match"]
+        print("aiiiiiiiiiiiiiiiiiiiiiiiiiiimaatchhh")
+        print(used_ai_to_match)
     else:
         # Inspect why it failed
         #print("aiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii response")
@@ -1227,8 +1396,8 @@ def get_data(invoiceID):
         "po_id":resp['po_id'],
         "invoice_type" :"manual_review",
         "message":"AI Item Matching failed",
-        "fail_reasons": resp["fail_reasons"],
-        "ai_Response": resp["ai_resp"],
+        "fail_reasons": resp.get("fail_reasons", []),
+        "ai_Response": resp.get("ai_resp"),
         'status': 'error'
         },status_code= 400)
         
@@ -1354,21 +1523,23 @@ def get_data(invoiceID):
         'line_item_count':line_item_count,
         
         'close_po': close_po, 
+        'ai_match':used_ai_to_match,
+
         'invoice_file_path': ""
     }
 
     uiresponse=transform_for_ui(response)
-    #emailcontent = "\n".join(json.dumps(obj) for obj in uiresponse)
-    emailcontent = ""
+    # #emailcontent = "\n".join(json.dumps(obj) for obj in uiresponse)
+    # emailcontent = ""
 
-    chunks = [json.dumps(obj) for obj in uiresponse]
-    emailcontent = chunks[0]  # first object with no delimiter
+    # chunks = [json.dumps(obj) for obj in uiresponse]
+    # emailcontent = chunks[0]  # first object with no delimiter
 
-    for chunk in chunks[1:]:
-        emailcontent += "\n?()?\n" + chunk
+    # for chunk in chunks[1:]:
+    #     emailcontent += "\n?()?\n" + chunk
 
-    #emailcontent += "\n?()?\n"
-    send_email(emailcontent)
+    # #emailcontent += "\n?()?\n"
+    # send_email(emailcontent)
     print("Invoice Processed Successfully.")
     print("TOTAL:",invoice_items_ready[0]['InvoiceDetailSummary:NetAmount'])
 
@@ -1389,20 +1560,61 @@ def get_po_data(invoiceID: str):
  #function that calls all other validator functions
     return get_data(invoiceID)
 
+
 #API Endpoint invoice-succesufully-proccesed by rpa bot
 @app.post("/rpa/invoice-processed")
 def process_invoice(payload: dict):
+    nyc_tz = ZoneInfo("America/New_York")
+    current_dt = datetime.now(nyc_tz)
     invoice_id = payload.get("invoice_id").strip().lower()
     po_number = payload.get("po_number").strip().lower()
+    transaction_id = (payload.get("transaction_id") or "").strip().lower()
+    trx_id = "error"
+    trx_valid = False
 
-    if not invoice_id or not po_number:
+    if not invoice_id or not po_number or not transaction_id: #change
          return JSONResponse(status_code=400, content={
         "success": False,
         "code": "MISSING_FIELDS",
-        "message": "Missing invoice_id or po_number in request.",
+        "message": "Missing invoice_id , po_number or transaction_id in request.",
         "errors": []
         }
         )
+    #check if transaction_id that rpa sent exists in sampro 
+    def build_trx_query(transaction_id: str) -> str:
+        trx = (transaction_id or "").replace("'", "''")  # escape single quotes
+
+        return f"""
+        SELECT TOP 1
+            a.apjrnl_id AS TransactionID,
+            a.apjrnl_invce_nmbr AS InvoiceNumber,
+            p.prchseordr_id AS PO_ID
+        FROM apjrnl a
+        LEFT JOIN prchseordr p
+            ON a.prchseordr_rn = p.prchseordr_rn
+        WHERE a.apjrnl_id = '{trx}'
+        
+        """
+    trx_query= build_trx_query(transaction_id)  
+    result=sql_executor(trx_query)
+ 
+    if not result:
+        trx_id="error"
+    else:
+        row = result[0]   # take the first dict
+        
+        db_trx_id = row.get("TransactionID", "").strip()
+        db_inv_id = row.get("InvoiceNumber", "").strip()
+        db_po_id  = row.get("PO_ID", "").strip()
+
+        if (db_trx_id == transaction_id and 
+            db_inv_id == invoice_id and 
+            db_po_id == po_number):
+            trx_id = db_trx_id
+            trx_valid = True
+        else:
+            trx_id = "error"
+            trx_valid = False
 
     conn = get_db_connection()
     cursor = conn.cursor(dictionary=True)
@@ -1433,35 +1645,43 @@ def process_invoice(payload: dict):
         locked_invoices = cursor.fetchall()
 
         for inv in locked_invoices:
-            inv_id = inv['invoice_id']
-            result, status_code = get_data(inv_id)
+            inv_id = inv['Invoice_id']
+            response = get_data(inv_id)
+
+            result = json.loads(response.body)
+            status_code = response.status_code
+
+            wrapped={
+                "body":result,
+                "status":status_code
+            }
 
             if status_code == 200:
                 cursor.execute("""
                     UPDATE processscheduler
-                    SET status = 'ready_to_be_processed', locked = 0,Date = NOW()
+                    SET status = 'Ready_to_proccess', locked = 0,Date = %s,Decision_Payload = %s
                     WHERE Invoice_id = %s
-                """, (inv_id,))
+                """, (current_dt,json.dumps(wrapped),inv_id,))
                 conn.commit()
-                break
+                break   
             else:
                 status_reason = result.get("message", "validation_failed")
                 new_status = result.get("invoice_type", "error")
 
                 cursor.execute("""
                     UPDATE processscheduler
-                    SET status = %s, status_reason = %s, locked = 0,Date = NOW()
+                    SET status = %s, status_reason = %s, locked = 0,Date = %s,Decision_Payload = %s
                     WHERE Invoice_id = %s
-                """, (new_status, status_reason, inv_id))
+                """, (new_status, status_reason, current_dt ,json.dumps(wrapped), inv_id))
 
             conn.commit()
 
         #Mark the triggering invoice as processed
         cursor.execute("""
             UPDATE processscheduler
-            SET status = 'Processed', locked = 0,Date = NOW()
+            SET status = 'Processed',status_reason = 'Processed' ,locked = 0,Date = %s,transaction_id=%s
             WHERE Invoice_id = %s
-        """, (invoice_id,))
+        """, (current_dt,trx_id,invoice_id,))
         conn.commit()
 
         return JSONResponse(
@@ -1473,6 +1693,8 @@ def process_invoice(payload: dict):
                 "data": {
                     "invoice_id": invoice_id,
                     "po_number": po_number,
+                    "transaction_id": transaction_id,
+                    "trx_valid:":trx_valid,
                     "updated": True
                 }
             }
@@ -1491,7 +1713,7 @@ def process_invoice(payload: dict):
 
 @app.post("/rpa/failed")
 def rpa_failed(payload: dict):
-   
+    current_dt = datetime.now()
     invoice_id = payload.get("invoice_id").strip().lower()
     po_number = payload.get("po_number").strip().lower()
     failed_reason = payload.get("failed_reason").strip().lower()
@@ -1506,11 +1728,11 @@ def rpa_failed(payload: dict):
             UPDATE processscheduler
             SET Status = %s,
                 Status_reason = %s,
-                Date = NOW()
+                Date = %s
             WHERE LOWER(Invoice_id) = %s
               AND LOWER(Sampro_ponumber) = %s
         """
-        cur.execute(sql, (status, status_reason, invoice_id, po_number))
+        cur.execute(sql, (status, status_reason ,current_dt, invoice_id, po_number))
         conn.commit()
 
         if cur.rowcount == 0:
@@ -1539,6 +1761,65 @@ def rpa_failed(payload: dict):
         except Exception:
             pass
         conn.close()
+        
+#endpoint to send email to rpa
+@app.post("/invoice/send-email")
+def email_invoice(payload: dict):
+    invoice_id = payload.get("invoice_id")
 
+    if not invoice_id:
+        raise HTTPException(status_code=400, detail="Missing invoice_id in request.")
 
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
 
+    try:
+        #Step 1: Query decision_payload for the invoice
+        cursor.execute("""
+            SELECT decision_payload,Status
+            FROM processscheduler
+            WHERE Invoice_id = %s
+            LIMIT 1
+        """, (invoice_id,))
+        row = cursor.fetchone()
+
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Invoice {invoice_id} not found in processscheduler.")
+        if row["Status"] != "Ready_to_proccess":
+            raise HTTPException(status_code=400, detail=f"Invoice {invoice_id} already processed (current status: {row['Status']}).")
+        decision_payload = row["decision_payload"]
+
+        #format the decision load as the rpa wants it 
+        payload_dict = json.loads(decision_payload, object_pairs_hook=dict)  # preserves insertion order
+        body_items = payload_dict.get("body", [])
+        chunks = [json.dumps(obj) for obj in body_items]
+        emailcontent = chunks[0]  # first object with no delimiter
+
+        for chunk in chunks[1:]:
+            emailcontent += "\n?()?\n" + chunk
+        
+        send_email(emailcontent)
+        cursor.execute("""
+            UPDATE processscheduler
+            SET Status = %s,
+            Status_reason=%s
+            WHERE Invoice_id = %s
+        """, ("sent_to_rpa","Email sent to RPA" , invoice_id))
+        conn.commit()
+        #Return API response
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": True,
+                "invoice_id": invoice_id,
+                "decision_payload": decision_payload,
+                "message": "Email sent successfully"
+            }
+        )
+
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cursor.close()
+        conn.close()

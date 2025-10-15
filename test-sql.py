@@ -4,7 +4,7 @@ import os
 load_dotenv()
 
 def sql_executor(sql_query: str):
-    url = "http://10.10.30.183/api/v1/sql" # local IP
+    url = "http://10.10.30.183/api/v1/sqltest" # local IP
     headers = {
         "content-type": "application/json",
         "X-API-Key": os.getenv('sql_client_api_key')
