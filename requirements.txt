@@ -6,4 +6,6 @@ pyodbc==5.2.0
 openai==1.100.2
 python-dotenv==1.1.1
 gunicorn==23.0.0
+boto3==1.40.56
+botocore==1.40.56
 

@@ -17,6 +17,12 @@ from fastapi import FastAPI, HTTPException
 import uvicorn
 from fastapi.middleware.cors import CORSMiddleware
 
+import boto3
+import botocore
+import uuid
+import zipfile
+from io import BytesIO
+
 
 # print(pyodbc.version)
 
@@ -119,7 +125,8 @@ WITH all_lines AS (
         prchseordrlst_qntty_ordrd   AS qty_ordered_line,
         prchseordrlst_qntty_rcvd    AS qty_received_line,
         prchseordrlst_unt_cst       AS unit_cost,
-        NULLIF(invntryitm_rn,0)     AS invntryitm_rn
+        NULLIF(invntryitm_rn,0)     AS invntryitm_rn,
+        po_glentty_glentty_rn       AS line_glentty_rn  -- GL entity from line
     FROM prchseordrlst
 
     UNION ALL
@@ -135,7 +142,8 @@ WITH all_lines AS (
         prchseordrlstgn_qntty_ordrd,
         prchseordrlstgn_qntty_rcvd,
         prchseordrlstgn_unt_cst,
-        NULL
+        NULL,
+         glentty_rn  -- GL entity from line
     FROM prchseordrlstgn
 ),
 
@@ -219,8 +227,9 @@ SELECT
     p.prchseordr_id,
     p.po_wrkordr_rn,
     vndr.vndr_id,
-    COALESCE(gj.glentty_rn, glc.glentty_rn, gcmp.glentty_rn) AS glentty_rn,
-    COALESCE(gj.glentty_id, glc.glentty_id, gcmp.glentty_id) AS glentty_id,
+     -- Use line GL entity FIRST, then fallback to location/company
+    COALESCE(gl_line.glentty_rn, glc.glentty_rn, gcmp.glentty_rn) AS glentty_rn,
+    COALESCE(gl_line.glentty_id, glc.glentty_id, gcmp.glentty_id) AS glentty_id,
     jb.jb_rn,
     jb.jb_id,
     wo.wrkordr_rn,
@@ -261,6 +270,7 @@ LEFT JOIN glentty glc        ON glc.glentty_rn=l.glentty_rn
 LEFT JOIN glentty gcmp       ON gcmp.glentty_rn=p.cmpny_glentty_glentty_rn
 
 LEFT JOIN all_lines al ON p.prchseordr_rn=al.prchseordr_rn
+LEFT JOIN glentty gl_line    ON gl_line.glentty_rn=al.line_glentty_rn  -- Line GL entity
 
 -- LIST joins
 LEFT JOIN received_by_item rbi ON rbi.po_id_trim=RTRIM(p.prchseordr_id)
@@ -1552,7 +1562,100 @@ def get_data(invoiceID):
 
 # @app.route('/purchaseorder/<string:poID>', methods=['GET'])
 # def get_podata(poID):
-    
+def fetch_and_upload_invoice_attachments(invoice_id: str, transaction_id: str) -> list:
+    """
+    Fetch the ZIP of attachments for the given invoice_id, extract PDFs,
+    and upload each to S3 using invoice_id + transaction_id in the name.
+    Returns list of uploaded S3 paths.
+    """
+    # ========= CONFIG =========
+    BASE_URL = "https://tools.daynitetools.com/api"
+    SEARCH_ENDPOINT = f"{BASE_URL}/emailsearch"
+    DOWNLOAD_ENDPOINT = f"{BASE_URL}/downloadattachment"
+    BUCKET_NAME = "daynitetools-invoice-automation-bucket"
+    TMP_DIR = "/tmp"
+    USER_EMAIL = "AP@wearetheone.com"
+# ==========================
+    uploaded_paths = []
+
+    try:
+        api_key = os.getenv("TOOLS_API_KEY")
+        headers = {
+            "x-api-key": api_key,
+            "Content-Type": "application/json"
+        }
+        # Step 1️ Search for the email
+        payload = {
+            "search_term": invoice_id,
+            "user": USER_EMAIL,
+            "strict": True,
+            "attachments": True
+        }
+        search_resp = requests.post(SEARCH_ENDPOINT, headers=headers, json=payload, timeout=60)
+
+        search_resp.raise_for_status()
+        data = search_resp.json()
+        matches = data.get("matches", [])
+        if not matches:
+            print(f"No emails found for invoice_id={invoice_id}")
+            return uploaded_paths
+
+        email_id = matches[0].get("id")
+        print(f" Found email ID: {email_id}")
+
+        if not email_id:
+            print(f" No email found for invoice_id={invoice_id}")
+            return uploaded_paths
+
+        download_payload = {
+            "graph_id": email_id,
+            "user": USER_EMAIL  
+            }
+
+        # Step 2️ Download the ZIP
+        print(f" Downloading attachments ZIP for invoice {invoice_id}...")
+        dl_resp = requests.post(DOWNLOAD_ENDPOINT, headers=headers, json=download_payload, timeout=120)
+
+        dl_resp.raise_for_status()
+
+        if "zip" not in dl_resp.headers.get("Content-Type", ""):
+            print(f"Expected ZIP, got Content-Type={dl_resp.headers.get('Content-Type')}")
+            return uploaded_paths
+
+        zip_data = BytesIO(dl_resp.content)
+        with zipfile.ZipFile(zip_data, "r") as zf:
+            pdf_files = [f for f in zf.namelist() if f.lower().endswith(".pdf")]
+            if not pdf_files:
+                print(" No PDF files found inside ZIP.")
+                return uploaded_paths
+
+                
+            sts = boto3.client("sts")
+            identity = sts.get_caller_identity()
+            print(f" Using IAM Role ARN: {identity['Arn']}")
+            s3 = boto3.client("s3")
+              # Verify identity
+           
+
+            for pdf_file in pdf_files:
+                with zf.open(pdf_file) as pdf_data:
+                    pdf_bytes = pdf_data.read()
+                    filename = os.path.basename(pdf_file)
+                    key = f"invoices/{invoice_id}/{invoice_id}_{transaction_id}_{filename}"
+
+                    print(f"⬆ Uploading {filename} → s3://{BUCKET_NAME}/{key}")
+                    s3.put_object(Bucket=BUCKET_NAME, Key=key, Body=pdf_bytes, ContentType="application/pdf")
+
+                    s3_path = f"s3://{BUCKET_NAME}/{key}"
+                    uploaded_paths.append(s3_path)
+
+            print(f" Uploaded {len(uploaded_paths)} PDFs for invoice {invoice_id}.")
+
+        return uploaded_paths
+
+    except Exception as e:
+        print(f" Error processing invoice {invoice_id}: {e}")
+        return uploaded_paths    
 # API Endpoint
 @app.get("/invoice/{invoiceID}")
 def get_po_data(invoiceID: str):
@@ -1683,6 +1786,12 @@ def process_invoice(payload: dict):
             WHERE Invoice_id = %s
         """, (current_dt,trx_id,invoice_id,))
         conn.commit()
+
+        uploaded_paths = fetch_and_upload_invoice_attachments(invoice_id, transaction_id)
+        if uploaded_paths:
+            print(f"Uploaded {len(uploaded_paths)} PDFs: {uploaded_paths}")
+        else:
+            print(f" No attachments uploaded for {invoice_id}")
 
         return JSONResponse(
             status_code=200,
