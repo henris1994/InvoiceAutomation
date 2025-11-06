@@ -1646,8 +1646,11 @@ def fetch_and_upload_invoice_attachments(invoice_id: str, transaction_id: str) -
                     print(f"⬆ Uploading {filename} → s3://{BUCKET_NAME}/{key}")
                     s3.put_object(Bucket=BUCKET_NAME, Key=key, Body=pdf_bytes, ContentType="application/pdf")
 
-                    s3_path = f"s3://{BUCKET_NAME}/{key}"
-                    uploaded_paths.append(s3_path)
+                    region = "us-east-1"  # your bucket's region
+                    public_url = f"https://{BUCKET_NAME}.s3.{region}.amazonaws.com/{key}"
+
+                    uploaded_paths.append(public_url)
+                    print(f" Browser URL: {public_url}")
 
             print(f" Uploaded {len(uploaded_paths)} PDFs for invoice {invoice_id}.")
 
@@ -1786,12 +1789,29 @@ def process_invoice(payload: dict):
             WHERE Invoice_id = %s
         """, (current_dt,trx_id,invoice_id,))
         conn.commit()
-
+        #get the url-paths uploaded in s3 bucket
         uploaded_paths = fetch_and_upload_invoice_attachments(invoice_id, transaction_id)
+
         if uploaded_paths:
             print(f"Uploaded {len(uploaded_paths)} PDFs: {uploaded_paths}")
+
+            # Join multiple URLs into a single comma-separated string
+            urls_combined = ", ".join(uploaded_paths)
+
+            try:
+                cursor.execute("""
+                    UPDATE processscheduler
+                    SET Invoice_url = %s
+                    WHERE Invoice_id = %s
+                """, (urls_combined, invoice_id))
+                conn.commit()
+                print(f" Updated Invoice_url for invoice_id={invoice_id}")
+            except Exception as e:
+                print(f" Failed to update Invoice_url: {e}")
+
         else:
-            print(f" No attachments uploaded for {invoice_id}")
+            print(f"No attachments uploaded for {invoice_id}")
+
 
         return JSONResponse(
             status_code=200,
