@@ -16,7 +16,7 @@ All business rules can be found in:
 service/validation/invoicerules.py
 
 🧩 Flow Explanation
-1.Vendors upload invoices
+1.Vendors upload invoices-
 Vendors submit their invoices to the Marketplace portal/database. Each record contains item part numbers, unit_prices,taxes,extracharges and PO references etc.
 
 2.ActivePieces detects new invoices
