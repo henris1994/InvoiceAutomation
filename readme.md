@@ -39,7 +39,9 @@ In the kpi AP team can send an email To the Rpa bot for the invoices that have s
 
 7.RPA Bot workflow
 Separately, the RPA bot polls the email for invoices sent by the AP team.
-It uses the JSON payload to automatically create the corresponding invoice in Sampro ERP.
+It uses the JSON payload to automatically create the corresponding invoice in Sampro ERP.\
+After completion Rpa bot  hits one of the Api-s success or failure.
+Those Api routes and all others can be found on the controllers of this repository.
 
 Tips:
 
