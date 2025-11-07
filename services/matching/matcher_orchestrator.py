@@ -1,6 +1,6 @@
 from utils.utilfunctions import _normalize_for_id,_norm
 import hashlib
-from matching.matcher_id import _assign_invoice_line_numbers
+from services.matching.matcher_id import _assign_invoice_line_numbers
 
 #Compare Invoice to PO if not perfect match in terms of items_id-s fallback to Ai description
 def validate_and_match_invoice_items_against_po_strict(

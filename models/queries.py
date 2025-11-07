@@ -2,6 +2,9 @@ import mysql.connector
 from models.dbconfigs import marketplace_config,db_config
 import requests
 import os
+from dotenv import load_dotenv
+load_dotenv()
+
 #sampro PO query
 def build_po_query(po_id: str) -> str:
     """

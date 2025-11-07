@@ -1,10 +1,14 @@
 import os
 from dotenv import load_dotenv
+load_dotenv()
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from controllers.invoice_controller import router as invoice_router
 
 
-load_dotenv()
+
+
+
 print("TEST_ENV_SOURCE =", os.getenv("TEST_ENV_SOURCE"))
 
 app = FastAPI()
@@ -18,5 +22,7 @@ app.add_middleware(
 )
 
 
-  
+# Register routes
+app.include_router(invoice_router)
+
 

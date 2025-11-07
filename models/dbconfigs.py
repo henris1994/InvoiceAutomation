@@ -1,6 +1,7 @@
 import os
 import mysql.connector
 # DB connection settings vendorinvoiceautomation db
+
 db_config = {
     'host': os.getenv("VENDOR_DB_HOST"),
     'port':int(os.getenv("MARKETPLACE_DB_PORT", 3306)),
