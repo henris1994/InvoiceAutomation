@@ -1,5 +1,5 @@
 from decimal import Decimal
-#transform response as UI expects it 
+#transform response as RPA BOT  expects it 
 def transform_for_ui(response):
     output = []
     invoice_total = Decimal(response['invoice_total'])
