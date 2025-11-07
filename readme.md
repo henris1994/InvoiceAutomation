@@ -1,4 +1,40 @@
 # Invoice Automation Bot
+📘 Overview
+
+This Invoice Automation API is a backend service designed to automate the invoice-to-PurchaseOrder  validation and entry process for vendor invoices received from  marketplaces(database which vendors input their invoices).
+Traditionally, the Accounts Payable (AP) department manually compares each incoming invoice with its corresponding Purchase Order (PO) in Sampro, checking part numbers, prices, quantities, and ensuring that the invoice hasn’t already been processed. This manual workflow is time-consuming, error-prone, and a bottleneck in the invoice lifecycle.
+
+The system replaces that manual verification process with a fully automated pipeline that performs all validation checks programmatically and prepares the data for direct ingestion by an RPA (Robotic Process Automation) bot. Once an invoice passes all validations, it is automatically packaged into a structured JSON payload containing all the details required to create the invoice in Sampro by the RPA Bot. All the json payloads are store in the processscheduler table-stores every output this endpoint produces. This allows the RPA bot to enter invoices without human intervention, while ensuring all business rules are consistently enforced.
+
+In essence, the system acts as an intelligent pre-processor between marketplace data and the ERP system — automatically selecting , validating, invoices before they reach Sampro. The result is a dramatic reduction in AP workload, improved data accuracy, and faster processing turnaround.
+At the moment, this API is configured to only allow invoices whose items have the exact same prices as their corresponding PO items.--bussines rules can be found under service/validation invoicerules.py
+
+Key Features
+
+Automated PO Matching: Locates the correct Purchase Order in sampro  for each invoice using vendor and item identifiers.
+
+Comprehensive Validation Engine: Applies a full suite of business logic checks — price, quantity, part number, duplication, and balance validations.
+
+RPA-Ready JSON Output: Produces structured payloads that allow RPA bots to enter invoices directly into Sampro without any additional parsing.
+
+Audit & Logging: Every validation and decision is logged, enabling traceability and auditability for compliance and financial review.
+
+Seamless Integration: Built with modular connectors for SQL Server (Sampro), MySQL (Marketplace + ProcessScheduler), and API endpoints to integrate with external systems.
+
+Business Impact
+
+Reduced Manual Processing: 80–90% of AP workload automated.
+
+Improved Accuracy: Eliminates human data-entry errors and duplicate invoices.
+
+Faster Cycle Times: Valid invoices are ready for posting in minutes.
+
+Transparent Operations: All invoice outcomes (bad_invoice, early_invoice,manual_review,Ready_to_proccess etc.) are logged in a processscheduler table  using Activepieces as the main flow Orchestrator.
+Tips:
+ (ActivePieces) docs can be found in notion. Active pieces uses this Endpoint to validate if an invoice is elegible to be input into Sampro.This is the sole function of this Api Endpoint.To Get a better understanding of how the whole flow works check ActivePieces docs in Notion.
+
+
+
 
 ## Development
 1. ```python3 -m venv .venv``` creates a virtual env named .venv
