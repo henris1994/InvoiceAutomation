@@ -16,28 +16,28 @@ All business rules can be found in:
 service/validation/invoicerules.py
 
 🧩 Flow Explanation
-1.Vendors upload invoices-
+1.Vendors upload invoices  
 Vendors submit their invoices to the Marketplace portal/database. Each record contains item part numbers, unit_prices,taxes,extracharges and PO references etc.
 
-2.ActivePieces detects new invoices
+2.ActivePieces detects new invoices  
 A scheduled flow every 10 minutes (ActivePieces) pulls the newly created invoices.
 
-3.Check PO lock status
+3.Check PO lock status  
 Before calling the Invoice Automation API, ActivePieces verifies that the corresponding Purchase Order (PO) is unlocked — meaning there are no previous invoices still queued for RPA entry. This prevents duplicate or overlapping processing.
 
-4.Invoice Automation API
+4.Invoice Automation API  
 Once a PO is confirmed available, ActivePieces calls the Invoice Automation Endpoint.
 The API compares the invoice from marketplace against its PO in Sampro, runs all validation checks, and returns a structured JSON payload describing whether the invoice is valid and ready for automation.
 If the API response is 200 , invoice passed all validations gets marked with status='Ready_to_process', otherwise API Response will be 400/404 with corresponding fields explaining the failure reason.
 
-5.Activepieces saves the output
+5.Activepieces saves the output  
 The Activepieces system receives this JSON response and stores it in the processscheduler table, which acts as the master log and queue of all validation results (ready_to_process, manual_review, bad_invoice, etc.).
 
-6.KPI Invoice Automation UI
+6.KPI Invoice Automation UI  
 The front-end KPI dashboard fetches results from the processscheduler table and displays them to users in real time — allowing AP staff to monitor which invoices are valid, pending, or rejected.
 In the kpi AP team can send an email To the Rpa bot for the invoices that have status Ready_to_process(email content is the json object the RPA BOT needs to input the invoice in sampro.
 
-7.RPA Bot workflow
+7.RPA Bot workflow  
 Separately, the RPA bot polls the email for invoices sent by the AP team.
 It uses the JSON payload to automatically create the corresponding invoice in Sampro ERP.\
 After completion Rpa bot  hits one of the Api-s success or failure.
