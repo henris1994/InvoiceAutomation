@@ -15,7 +15,7 @@ At the moment, this API is configured to only allow invoices whose items have th
 All business rules can be found in:
 service/validation/invoicerules.py
 
-🧩 Flow Explanation
+🧩 Flow Explanation  
 1.Vendors upload invoices  
 Vendors submit their invoices to the Marketplace portal/database. Each record contains item part numbers, unit_prices,taxes,extracharges and PO references etc.
 
