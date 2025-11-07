@@ -1,56 +1,60 @@
-# Invoice Automation API
+🧾 Invoice Automation API
 📘 Overview
 
-The Invoice Automation API is a backend service designed to automate the invoice-to–Purchase Order (PO) validation, comparison, and entry process for vendor invoices received from marketplaces (databases where vendors upload their invoices).
+The Invoice Automation API is a backend service that automates the invoice-to–Purchase Order (PO) validation, comparison, and entry process for vendor invoices received from marketplaces (databases where vendors upload their invoices).
 
-Traditionally, the Accounts Payable (AP) department manually compares each incoming invoice with its corresponding PO in Sampro, checking part numbers, prices, quantities, and ensuring that the invoice hasn’t already been processed. This manual workflow is time-consuming, error-prone, and a major bottleneck in the invoice lifecycle.
+Traditionally, the Accounts Payable (AP) team manually compared each invoice against its PO in Sampro, checking part numbers, prices, quantities, and ensuring that invoices weren’t duplicated. This manual workflow was slow, error-prone, and created major bottlenecks.
 
-The system replaces that manual verification process with a fully automated pipeline that performs all validation checks programmatically and prepares the data for direct ingestion by an RPA (Robotic Process Automation) bot. Once an invoice passes all validations, it is automatically packaged into a structured JSON payload containing all the details required for the RPA bot to create the invoice in Sampro.
+The Invoice Automation API replaces that process with a fully automated validation pipeline. It compares invoices to their POs programmatically, enforces business rules, and generates structured JSON payloads for direct ingestion by an RPA bot that creates the invoice in Sampro.
 
-All JSON payloads are stored in the processscheduler table, which records every output this endpoint produces. This allows the RPA bot to enter invoices without human intervention while ensuring all business rules are consistently enforced.
-The result is a dramatic reduction in AP workload, improved data accuracy, and faster processing turnaround.
+All API outputs are stored in the processscheduler table, which logs every response and serves as the integration point for downstream systems like the RPA Bot and the KPI Dashboard.
+This automation significantly reduces AP workload, improves data accuracy, and speeds up processing times.
 
 Note:
-At the moment, this API is configured to only allow invoices whose items have the exact same prices as their corresponding PO items.
-All business rules can be found in:
-service/validation/invoicerules.py
+Currently, this API only allows invoices whose item prices exactly match their corresponding PO line items.
+Business rules are defined under: service/validation/invoicerules.py.
 
-🧩 Flow Explanation  
+🧩 End-to-End Flow  
+
 1.Vendors upload invoices  
-Vendors submit their invoices to the Marketplace portal/database. Each record contains item part numbers, unit_prices,taxes,extracharges and PO references etc.
+Vendors submit invoices to the Marketplace database. Each record includes part numbers, unit prices, taxes, extra charges, and PO references.  
 
 2.ActivePieces detects new invoices  
-A scheduled flow every 10 minutes (ActivePieces) pulls the newly created invoices.
+A scheduled ActivePieces flow (runs every 10 minutes) fetches newly created invoices.
 
 3.Check PO lock status  
-Before calling the Invoice Automation API, ActivePieces verifies that the corresponding Purchase Order (PO) is unlocked — meaning there are no previous invoices still queued for RPA entry. This prevents duplicate or overlapping processing.
+ActivePieces verifies that the PO is unlocked (no previous invoices waiting in the queue for RPA entry). This prevents duplicate or overlapping automation runs.
 
-4.Invoice Automation API  
-Once a PO is confirmed available, ActivePieces calls the Invoice Automation Endpoint.
-The API compares the invoice from marketplace against its PO in Sampro, runs all validation checks, and returns a structured JSON payload describing whether the invoice is valid and ready for automation.
-If the API response is 200 , invoice passed all validations gets marked with status='Ready_to_process', otherwise API Response will be 400/404 with corresponding fields explaining the failure reason.
+4.Invoice Automation API call  
+For each unlocked PO, ActivePieces calls the Invoice Automation API.
 
-5.Activepieces saves the output  
-The Activepieces system receives this JSON response and stores it in the processscheduler table, which acts as the master log and queue of all validation results (ready_to_process, manual_review, bad_invoice, etc.).
+5.The API validates the invoice against its PO in Sampro.  
 
-6.KPI Invoice Automation UI  
-The front-end KPI dashboard fetches results from the processscheduler table and displays them to users in real time — allowing AP staff to monitor which invoices are valid, pending, or rejected.
-In the kpi AP team can send an email To the Rpa bot for the invoices that have status Ready_to_process(email content is the json object the RPA BOT needs to input the invoice in sampro.
+If all checks pass, it returns a structured JSON payload and HTTP 200 (status = "Ready_to_process").
 
-7.RPA Bot workflow  
-Separately, the RPA bot polls the email for invoices sent by the AP team.
-It uses the JSON payload to automatically create the corresponding invoice in Sampro ERP.\
-After completion Rpa bot  hits one of the Api-s success or failure.  
-The status changes in processcheduler tables based on Rpa response.
-Those Api routes and all others can be found on the controllers of this repository.
+If validation fails, it returns 400 or 404 with detailed error fields explaining the failure reason.
 
-Tips:
+6.ActivePieces saves the output  
+The JSON response is stored in the processscheduler table, which serves as a master queue and audit log for all invoices and statuses (ready_to_process, manual_review, bad_invoice, etc.).
 
-Documentation for ActivePieces can be found in Notion.
+7.KPI Invoice Automation UI  
+The KPI Dashboard fetches data from processscheduler and displays invoices in real time.
+The AP team can review and trigger an email to the RPA bot for invoices marked Ready_to_process.
+The email content contains the JSON payload the bot needs to enter the invoice in Sampro.
 
-ActivePieces uses this API endpoint to validate whether an invoice is eligible to be entered into Sampro — this is the sole function of the endpoint.
+8.RPA Bot workflow  
+The RPA bot polls its email inbox for invoices sent by the AP team.
+Upon receiving the JSON payload, it automatically creates the invoice in Sampro ERP.
+Once done, the bot calls back one of the API’s success or failure endpoints, updating the invoice’s status in the processscheduler table.
+(All controller routes are defined in the controllers/ directory of this repository.)
 
-To understand the end-to-end workflow, refer to the ActivePieces documentation in Notion.
+💡 Tips
+
+Documentation for ActivePieces is available in Notion.
+
+ActivePieces uses this API to validate whether an invoice is eligible for entry into Sampro — this is the endpoint’s primary purpose.
+
+For full end-to-end architecture, refer to ActivePieces documentation in Notion.
 
 
 
